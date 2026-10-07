@@ -1,4 +1,5 @@
 import hmac
+import hashlib
 import logging
 import os
 import re
@@ -21,10 +22,12 @@ TELEGRAM_ADMIN_USER_ID = os.environ.get("TELEGRAM_ADMIN_USER_ID", "").strip()
 NAMES_FILE = "names.txt"
 COUNTER_FILE = "counter.txt"
 APPROVED_FILE = "approved.txt"
+DEVICES_FILE = "devices.txt"
 APP_DIR = Path(__file__).resolve().parent
 NAMES_PATH = APP_DIR / NAMES_FILE
 COUNTER_PATH = APP_DIR / COUNTER_FILE
 APPROVED_PATH = APP_DIR / APPROVED_FILE
+DEVICES_PATH = APP_DIR / DEVICES_FILE
 LOCK_PATH = APP_DIR / ".registration.lock"
 
 TELEGRAM_TIMEOUT_SECONDS = 10
@@ -127,7 +130,8 @@ PAGE = r"""<!doctype html>
       {% if message %}
         <div class="message {{ message_type }}" role="alert">{{ message }}</div>
       {% endif %}
-      <form method="post" action="/" autocomplete="on">
+      <form id="registration-form" method="post" action="/" autocomplete="on">
+        <input id="device-id" name="device_id" type="hidden">
         <label for="name">اسم المتسابق</label>
         <input id="name" name="name" type="text" maxlength="80"
                placeholder="اكتب الاسم الكامل" required autofocus>
@@ -145,9 +149,6 @@ PAGE = r"""<!doctype html>
       <div id="pass-status" class="status pending" role="status">
         ⏳ طلبك قيد المراجعة
       </div>
-      <button id="new-registration" class="secondary-button" type="button">
-        تسجيل متسابق آخر
-      </button>
     </section>
 
     <footer>نظام تسجيل المسابقة</footer>
@@ -156,13 +157,15 @@ PAGE = r"""<!doctype html>
   <script>
     "use strict";
     const STORAGE_KEY = "contestantRegistration";
+    const DEVICE_KEY = "contestantDeviceId";
     const initialRegistration = {{ bootstrap_registration | tojson }};
     const formSection = document.getElementById("form-section");
+    const registrationForm = document.getElementById("registration-form");
+    const deviceIdInput = document.getElementById("device-id");
     const passSection = document.getElementById("pass-section");
     const passName = document.getElementById("pass-name");
     const passNumber = document.getElementById("pass-number");
     const passStatus = document.getElementById("pass-status");
-    const newRegistrationButton = document.getElementById("new-registration");
     let activeRegistration = null;
     let statusTimer = null;
 
@@ -232,14 +235,25 @@ PAGE = r"""<!doctype html>
       }
     }
 
-    newRegistrationButton.addEventListener("click", function () {
+    function getOrCreateDeviceId() {
       try {
-        localStorage.removeItem(STORAGE_KEY);
+        let id = localStorage.getItem(DEVICE_KEY);
+        if (!id) {
+          const bytes = new Uint8Array(16);
+          window.crypto.getRandomValues(bytes);
+          id = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+          localStorage.setItem(DEVICE_KEY, id);
+        }
+        return id;
       } catch (error) {
-        console.warn("تعذر مسح بيانات التسجيل المحلية", error);
+        console.warn("تعذر إنشاء معرّف لهذا المتصفح", error);
+        return "";
       }
-      window.location.reload();
-    });
+    }
+
+    if (deviceIdInput) {
+      deviceIdInput.value = getOrCreateDeviceId();
+    }
 
     // بعد نجاح POST يرسل الخادم بيانات التسجيل للمتصفح مرة واحدة.
     if (isValidRegistration(initialRegistration)) {
@@ -405,6 +419,21 @@ def read_approved_numbers():
     }
 
 
+def read_registered_devices():
+    """قراءة بصمة المتصفح ورقم تسجيله من ملف devices.txt."""
+    try:
+        content = DEVICES_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+
+    devices = {}
+    for line in content.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[0] and parts[1].isdigit():
+            devices[parts[0]] = parts[1]
+    return devices
+
+
 def mark_number_approved(contestant_number):
     """حفظ رقم المتسابق في approved.txt بشكل آمن ودون تكرار."""
     number_text = str(int(contestant_number))
@@ -526,18 +555,36 @@ def register():
 
     # إزالة المسافات الزائدة والمتكررة؛ الأقواس مكتملة.
     name = re.sub(r"\s+", " ", request.form.get("name", "").strip())
+    device_id = request.form.get("device_id", "").strip()
     if not 2 <= len(name) <= MAX_NAME_LENGTH:
         return render_page(
             "يرجى إدخال اسم يتراوح بين حرفين و80 حرفًا.",
             "error",
             400,
         )
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", device_id):
+        return render_page(
+            "تعذر تحديد هذا المتصفح. فعّل التخزين المحلي ثم أعد تحميل الصفحة.",
+            "error",
+            400,
+        )
+
+    device_hash = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
 
     staged_names = None
     staged_counter = None
+    staged_devices = None
 
     try:
         with registration_lock():
+            registered_devices = read_registered_devices()
+            if device_hash in registered_devices:
+                return render_page(
+                    "سبق تسجيل متسابق من هذا المتصفح. لا يمكن تسجيل اسم آخر منه.",
+                    "error",
+                    409,
+                )
+
             registered_names = read_registered_names()
             existing_normalized = {
                 registered.casefold() for registered in registered_names
@@ -556,9 +603,15 @@ def register():
                 f"{registered}\n" for registered in updated_names
             )
             counter_content = f"{contestant_number}\n"
+            registered_devices[device_hash] = str(contestant_number)
+            devices_content = "".join(
+                f"{key}\t{registered_devices[key]}\n"
+                for key in sorted(registered_devices)
+            )
 
             staged_names = stage_text_file(NAMES_PATH, names_content)
             staged_counter = stage_text_file(COUNTER_PATH, counter_content)
+            staged_devices = stage_text_file(DEVICES_PATH, devices_content)
 
             # حفظ التسجيل محليًا بعد تأكيد إرسال رسالة تيليجرام بنجاح.
             send_registration_message(name, contestant_number)
@@ -566,6 +619,8 @@ def register():
             staged_names = None
             os.replace(staged_counter, COUNTER_PATH)
             staged_counter = None
+            os.replace(staged_devices, DEVICES_PATH)
+            staged_devices = None
 
         return render_page(
             status=200,
@@ -594,7 +649,7 @@ def register():
             500,
         )
     finally:
-        for staged_file in (staged_names, staged_counter):
+        for staged_file in (staged_names, staged_counter, staged_devices):
             if staged_file is not None:
                 try:
                     staged_file.unlink(missing_ok=True)
