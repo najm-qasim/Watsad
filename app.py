@@ -13,7 +13,7 @@ from flask import Flask, render_template_string, request
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# ملفات نصية محلية، وتُحفظ بجانب app.py.
+# ملفات التسجيل المحلية، وتُحفظ بجانب app.py.
 NAMES_FILE = "names.txt"
 COUNTER_FILE = "counter.txt"
 APP_DIR = Path(__file__).resolve().parent
@@ -28,13 +28,14 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 app.logger.setLevel(logging.INFO)
 
-# القفل يمنع التسجيلات المتزامنة من تعارض قراءة/تعديل الملفات.
+# القفل يمنع تداخل التسجيلات المتزامنة.
 # flock ينسّق بين عمليات Gunicorn على Linux.
 _THREAD_LOCK = threading.RLock()
 try:
     import fcntl
 except ImportError:  # توافق احتياطي مع الأنظمة غير الداعمة لـ POSIX
     fcntl = None
+
 
 PAGE = r"""<!doctype html>
 <html lang="ar" dir="rtl">
@@ -159,7 +160,7 @@ def read_registered_names():
 
 
 def read_counter(number_of_names):
-    """قراءة آخر رقم تسلسلي، أو التهيئة من عدد الأسماء عند غياب الملف."""
+    """قراءة آخر رقم تسلسلي أو التهيئة من عدد الأسماء عند غياب الملف."""
     try:
         raw_value = COUNTER_PATH.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -171,7 +172,9 @@ def read_counter(number_of_names):
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise RegistrationError("ملف العداد يحتوي على قيمة غير صالحة.") from exc
+        raise RegistrationError(
+            "ملف العداد يحتوي على قيمة غير صالحة."
+        ) from exc
 
     if value < 0:
         raise RegistrationError("ملف العداد يحتوي على قيمة غير صالحة.")
@@ -248,6 +251,7 @@ def register():
         return render_page()
 
     # إزالة المسافات الزائدة والمتكررة قبل فحص الاسم.
+    # الأقواس هنا مكتملة: request.form.get("name", "")
     name = re.sub(r"\s+", " ", request.form.get("name", "").strip())
 
     if not 2 <= len(name) <= MAX_NAME_LENGTH:
@@ -264,7 +268,7 @@ def register():
         with registration_lock():
             registered_names = read_registered_names()
 
-            # المقارنة غير حساسة لحالة الأحرف اللاتينية.
+            # منع تكرار الاسم بعد تنظيف المسافات.
             normalized_existing_names = {
                 existing.casefold() for existing in registered_names
             }
@@ -279,11 +283,11 @@ def register():
             last_number = read_counter(len(registered_names))
             contestant_number = last_number + 1
 
-            # صيغة الرسالة المرسلة إلى تيليجرام فقط.
+            # الرسالة المرسلة إلى تيليجرام بهذه الصيغة فقط.
             telegram_text = f"{contestant_number} - {name}"
 
-            # تجهيز محتوى الملفين في ملفات مؤقتة أولًا.
-            # لا يتم استبدال الملفات الأصلية إلا بعد تأكيد تيليجرام نجاح الإرسال.
+            # تجهيز الملفات المؤقتة أولًا؛ لا تُحدّث الملفات الأصلية
+            # إلا بعد تأكيد تيليجرام نجاح الإرسال.
             updated_names = registered_names + [name]
             names_content = "".join(
                 f"{registered_name}\n" for registered_name in updated_names
@@ -295,7 +299,7 @@ def register():
 
             send_telegram_message(telegram_text)
 
-            # استبدال ذري لكل ملف بعد نجاح الإرسال.
+            # استبدال كل ملف ذريًا بعد نجاح الإرسال.
             os.replace(staged_names, NAMES_PATH)
             staged_names = None
 
@@ -349,486 +353,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", "5000")),
         debug=False,
     )
-import os
-import re
-
-import requests
-from flask import Flask, render_template_string, request
-
-
-# ============================================================
-# إعدادات تيليجرام
-# ============================================================
-
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-
-# ============================================================
-# ملفات التخزين
-# ============================================================
-
-# ملف حفظ آخر رقم للمتسابق
-COUNTER_FILE = "counter.txt"
-
-# ملف حفظ أسماء المتسابقين
-NAMES_FILE = "names.txt"
-
-
-# ============================================================
-# Flask
-# ============================================================
-
-app = Flask(__name__)
-
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
-
-
-# ============================================================
-# صفحة التسجيل
-# ============================================================
-
-PAGE = r"""<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#102a43">
-
-  <title>تسجيل المتسابقين</title>
-
-  <style>
-
-    :root {
-      color-scheme: light;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      padding: 24px;
-
-      display: grid;
-      place-items: center;
-
-      font-family: Tahoma, Arial, sans-serif;
-      color: #102a43;
-
-      background:
-        radial-gradient(
-          circle at 15% 15%,
-          #d9f3ef 0,
-          transparent 32%
-        ),
-        linear-gradient(
-          135deg,
-          #eef5fb,
-          #f8fafc 55%,
-          #e5eff7
-        );
-    }
-
-    .card {
-      width: min(100%, 470px);
-      padding: clamp(25px, 7vw, 42px);
-
-      background: #fff;
-      border: 1px solid #e5edf4;
-      border-radius: 22px;
-
-      box-shadow:
-        0 20px 60px rgba(16, 42, 67, .12);
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-
-      padding: 8px 12px;
-      border-radius: 999px;
-
-      color: #087f70;
-      background: #e6f7f3;
-
-      font-size: 13px;
-      font-weight: 700;
-    }
-
-    h1 {
-      margin: 20px 0 10px;
-      font-size: clamp(25px, 6vw, 32px);
-    }
-
-    .intro {
-      margin: 0 0 26px;
-      line-height: 1.8;
-      color: #526779;
-    }
-
-    label {
-      display: block;
-      margin-bottom: 9px;
-
-      font-size: 15px;
-      font-weight: 700;
-    }
-
-    input {
-      width: 100%;
-      min-height: 52px;
-
-      padding: 12px 15px;
-
-      border: 1px solid #cbd8e3;
-      border-radius: 12px;
-
-      background: #fbfdff;
-      color: #102a43;
-
-      font: inherit;
-      outline: none;
-
-      transition:
-        border-color .2s,
-        box-shadow .2s;
-    }
-
-    input:focus {
-      border-color: #168f82;
-
-      box-shadow:
-        0 0 0 4px rgba(22,143,130,.12);
-    }
-
-    button {
-      width: 100%;
-      min-height: 52px;
-
-      margin-top: 16px;
-
-      border: 0;
-      border-radius: 12px;
-
-      color: white;
-      background: #087f70;
-
-      font: inherit;
-      font-weight: 700;
-
-      cursor: pointer;
-
-      transition:
-        transform .15s,
-        background .15s;
-    }
-
-    button:hover {
-      background: #06695e;
-    }
-
-    button:active {
-      transform: translateY(1px);
-    }
-
-    button:disabled {
-      opacity: .65;
-      cursor: wait;
-    }
-
-    .notice {
-      margin: 0 0 20px;
-      padding: 13px 15px;
-
-      border-radius: 11px;
-      line-height: 1.7;
-    }
-
-    .success {
-      color: #17653d;
-      background: #e8f7ed;
-      border: 1px solid #b8e7c8;
-    }
-
-    .error {
-      color: #9f2d2d;
-      background: #fff0f0;
-      border: 1px solid #f1c5c5;
-    }
-
-    .hint {
-      margin: 13px 0 0;
-
-      color: #718395;
-
-      font-size: 12px;
-      line-height: 1.7;
-    }
-
-    footer {
-      margin-top: 24px;
-
-      text-align: center;
-
-      color: #8192a1;
-
-      font-size: 12px;
-    }
-
-  </style>
-</head>
-
-<body>
-
-  <main class="card">
-
-    <span class="badge">
-      ● التسجيل مفتوح
-    </span>
-
-    <h1>
-      تسجيل المتسابقين
-    </h1>
-
-    <p class="intro">
-      أدخل اسمك لإكمال التسجيل في المسابقة.
-      سيصل التسجيل مباشرة إلى المنظّمين.
-    </p>
-
-
-    {% if success %}
-
-      <div class="notice success" role="status">
-        تم تسجيل اسمك بنجاح. بالتوفيق في المسابقة!
-      </div>
-
-    {% endif %}
-
-
-    {% if error %}
-
-      <div class="notice error" role="alert">
-        {{ error }}
-      </div>
-
-    {% endif %}
-
-
-    <form method="post" action="/" autocomplete="on">
-
-      <label for="name">
-        اسم المتسابق
-      </label>
-
-      <input
-        id="name"
-        name="name"
-        type="text"
-        maxlength="80"
-        minlength="2"
-        placeholder="اكتب الاسم الكامل"
-        required
-        autofocus
-      >
-
-      <button type="submit">
-        إرسال التسجيل
-      </button>
-
-      <p class="hint">
-        يرجى التأكد من كتابة الاسم بصورة صحيحة قبل الإرسال.
-      </p>
-
-    </form>
-
-
-    <footer>
-      نظام تسجيل المسابقة
-    </footer>
-
-  </main>
-
-</body>
-</html>
-"""
-
-
-# ============================================================
-# تنظيف الاسم
-# ============================================================
-
-def clean_name(name):
-    """
-    إزالة المسافات الزائدة من الاسم.
-    """
-
-    return re.sub(
-        r"\s+",
-        " ",
-        name.strip()
-    )
-
-
-# ============================================================
-# فحص الاسم المكرر
-# ============================================================
-
-def name_exists(name):
-    """
-    التحقق هل الاسم موجود مسبقًا في names.txt.
-    """
-
-    if not os.path.exists(NAMES_FILE):
-        return False
-
-    name = clean_name(name)
-
-    with open(
-        NAMES_FILE,
-        "r",
-        encoding="utf-8"
-    ) as file:
-
-        for saved_name in file:
-
-            saved_name = clean_name(saved_name)
-
-            if saved_name == name:
-                return True
-
-    return False
-
-
-# ============================================================
-# حفظ الاسم
-# ============================================================
-
-def save_name(name):
-    """
-    حفظ اسم المتسابق في names.txt.
-    """
-
-    with open(
-        NAMES_FILE,
-        "a",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(name + "\n")
-
-
-# ============================================================
-# العداد
-# ============================================================
-
-def get_next_number():
-
-    try:
-
-        with open(
-            COUNTER_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            last_number = int(
-                file.read().strip() or "0"
-            )
-
-    except (
-        FileNotFoundError,
-        ValueError
-    ):
-
-        last_number = 0
-
-
-    next_number = last_number + 1
-
-
-    with open(
-        COUNTER_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(str(next_number))
-
-
-    return next_number
-
-
-# ============================================================
-# إرسال التسجيل إلى تيليجرام
-# ============================================================
-
-def send_to_telegram(number, name):
-
-    if not BOT_TOKEN or not CHAT_ID:
-
-        raise RuntimeError(
-            "إعدادات تيليجرام غير مكتملة"
-        )
-
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
-
-
-    response = requests.post(
-
-        url,
-
-        json={
-            "chat_id": CHAT_ID,
-            "text": f"{number} - {name}"
-        },
-
-        timeout=10,
-    )
-
-
-    response.raise_for_status()
-
-
-    result = response.json()
-
-
-    if not result.get("ok"):
-
-        raise RuntimeError(
-            "رفض تيليجرام إرسال الرسالة"
-        )
-
-
-# ============================================================
-# الصفحة الرئيسية
-# ============================================================
-
-@app.route("/", methods=["GET", "POST"])
-def register():
-
-    # --------------------------------------------------------
-    # فتح الصفحة
-    # --------------------------------------------------------
-
-    if request.method == "GET":
-
-        return render_template_string(
-            PAGE,
-            success=False,
-            error=None
-        )
-
-
-    # --------------------------------------------------------
-    # الحصول على الاسم
-    # --------------------------------------------------------
-
-    name = request.form.get(
