@@ -1,22 +1,47 @@
 import os
 import re
+import unicodedata
 
 import requests
+import psycopg2
 from flask import Flask, render_template_string, request
 
 
-# إعدادات تيليجرام: عيّن هذين المتغيرين في بيئة التشغيل أو في Render.
-# BOT_TOKEN: رمز البوت من BotFather
-# CHAT_ID: معرّف المحادثة أو المجموعة التي ستستقبل التسجيلات
+# ============================================================
+# إعدادات Telegram
+# ============================================================
+
+# ضعها في Environment Variables داخل Render
+#
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ملف حفظ آخر رقم للمتسابق
-COUNTER_FILE = "counter.txt"
+
+# ============================================================
+# إعدادات PostgreSQL
+# ============================================================
+
+# Render يوفر غالبًا DATABASE_URL
+# تلقائيًا عند ربط قاعدة PostgreSQL بالخدمة.
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+# ============================================================
+# Flask
+# ============================================================
 
 app = Flask(__name__)
+
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
+
+# ============================================================
+# صفحة التسجيل
+# ============================================================
 
 PAGE = r"""<!doctype html>
 <html lang="ar" dir="rtl">
@@ -24,10 +49,14 @@ PAGE = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#102a43">
+
   <title>تسجيل المتسابقين</title>
 
   <style>
-    :root { color-scheme: light; }
+
+    :root {
+      color-scheme: light;
+    }
 
     * {
       box-sizing: border-box;
@@ -126,6 +155,7 @@ PAGE = r"""<!doctype html>
 
     input:focus {
       border-color: #168f82;
+
       box-shadow:
         0 0 0 4px rgba(22,143,130,.12);
     }
@@ -203,8 +233,10 @@ PAGE = r"""<!doctype html>
 
       font-size: 12px;
     }
+
   </style>
 </head>
+
 
 <body>
 
@@ -214,32 +246,42 @@ PAGE = r"""<!doctype html>
       ● التسجيل مفتوح
     </span>
 
+
     <h1>
       تسجيل المتسابقين
     </h1>
+
 
     <p class="intro">
       أدخل اسمك لإكمال التسجيل في المسابقة.
       سيصل التسجيل مباشرة إلى المنظّمين.
     </p>
 
+
     {% if success %}
+
       <div class="notice success" role="status">
         تم تسجيل اسمك بنجاح. بالتوفيق في المسابقة!
       </div>
+
     {% endif %}
 
+
     {% if error %}
+
       <div class="notice error" role="alert">
         {{ error }}
       </div>
+
     {% endif %}
+
 
     <form method="post" action="/" autocomplete="on">
 
       <label for="name">
         اسم المتسابق
       </label>
+
 
       <input
         id="name"
@@ -252,15 +294,18 @@ PAGE = r"""<!doctype html>
         autofocus
       >
 
+
       <button type="submit">
         إرسال التسجيل
       </button>
+
 
       <p class="hint">
         يرجى التأكد من كتابة الاسم بصورة صحيحة قبل الإرسال.
       </p>
 
     </form>
+
 
     <footer>
       نظام تسجيل المسابقة
@@ -273,117 +318,479 @@ PAGE = r"""<!doctype html>
 """
 
 
-def get_next_number():
-    """الحصول على الرقم التالي وحفظه في ملف بسيط."""
+# ============================================================
+# الاتصال بقاعدة البيانات
+# ============================================================
 
-    try:
-        with open(COUNTER_FILE, "r", encoding="utf-8") as file:
-            last_number = int(file.read().strip() or "0")
-    except (FileNotFoundError, ValueError):
-        last_number = 0
+def get_db_connection():
+    """
+    إنشاء اتصال جديد بقاعدة PostgreSQL.
+    """
 
-    next_number = last_number + 1
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL غير موجود"
+        )
 
-    with open(COUNTER_FILE, "w", encoding="utf-8") as file:
-        file.write(str(next_number))
-
-    return next_number
-
-
-def send_to_telegram(number: int, name: str) -> None:
-    """إرسال رقم المتسابق واسمه فقط إلى Telegram."""
-
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("إعدادات تيليجرام غير مكتملة")
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    response = requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": f"{number} - {name}"
-        },
-        timeout=10,
+    return psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require"
     )
 
-    response.raise_for_status()
 
-    result = response.json()
+# ============================================================
+# إنشاء جدول المتسابقين
+# ============================================================
 
-    if not result.get("ok"):
-        raise RuntimeError("رفض تيليجرام إرسال الرسالة")
+def init_database():
+    """
+    إنشاء جدول المتسابقين إذا لم يكن موجودًا.
+    """
 
+    connection = get_db_connection()
 
-@app.route("/", methods=["GET", "POST"])
-def register():
+    try:
 
-    if request.method == "GET":
-        return render_template_string(
-            PAGE,
-            success=False,
-            error=None
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contestants (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
+
+        connection.commit()
+
+        cursor.close()
+
+    finally:
+
+        connection.close()
+
+
+# ============================================================
+# توحيد الاسم
+# ============================================================
+
+def normalize_name(name: str) -> str:
+    """
+    تجهيز الاسم للمقارنة ومنع التكرار.
+
+    مثال:
+
+    "  أحمد   محمد  "
+
+    تصبح:
+
+    "أحمد محمد"
+    """
 
     name = re.sub(
         r"\s+",
         " ",
-        request.form.get("name", "").strip()
+        name.strip()
     )
 
-    if len(name) < 2 or len(name) > 80:
-        return render_template_string(
-            PAGE,
-            success=False,
-            error="يرجى إدخال اسم يتراوح بين حرفين و80 حرفًا."
-        ), 400
+    name = unicodedata.normalize(
+        "NFC",
+        name
+    )
+
+    # casefold مفيد خصوصًا إذا احتوى الاسم
+    # على أحرف إنجليزية.
+    name = name.casefold()
+
+    return name
+
+
+# ============================================================
+# إرسال رسالة Telegram
+# ============================================================
+
+def send_to_telegram(
+    number: int,
+    name: str
+) -> None:
+
+    if not BOT_TOKEN or not CHAT_ID:
+
+        raise RuntimeError(
+            "إعدادات تيليجرام غير مكتملة"
+        )
+
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
+    )
+
+
+    response = requests.post(
+
+        url,
+
+        json={
+            "chat_id": CHAT_ID,
+            "text": f"{number} - {name}"
+        },
+
+        timeout=10
+    )
+
+
+    response.raise_for_status()
+
+
+    result = response.json()
+
+
+    if not result.get("ok"):
+
+        raise RuntimeError(
+            "رفض تيليجرام إرسال الرسالة"
+        )
+
+
+# ============================================================
+# تسجيل المتسابق
+# ============================================================
+
+def register_contestant(name: str):
+    """
+    تسجيل المتسابق بطريقة آمنة.
+
+    الخطوات:
+
+    1. التحقق من عدم وجود الاسم.
+    2. إنشاء رقم للمتسابق.
+    3. إرسال الاسم إلى Telegram.
+    4. حفظ التسجيل في PostgreSQL.
+
+    إذا كان الاسم موجودًا مسبقًا:
+    لا يتم إرسال Telegram
+    ولا يتم إنشاء رقم جديد.
+    """
+
+    connection = get_db_connection()
 
     try:
-        number = get_next_number()
+
+        # بدء Transaction
+        connection.autocommit = False
+
+        cursor = connection.cursor()
+
+
+        normalized_name = normalize_name(name)
+
+
+        # ----------------------------------------------------
+        # البحث عن الاسم
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT id
+            FROM contestants
+            WHERE normalized_name = %s
+            LIMIT 1
+            """,
+            (normalized_name,)
+        )
+
+
+        existing = cursor.fetchone()
+
+
+        if existing:
+
+            connection.rollback()
+
+            return {
+                "success": False,
+                "duplicate": True,
+                "number": None
+            }
+
+
+        # ----------------------------------------------------
+        # الحصول على الرقم التالي
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT COALESCE(
+                MAX(id),
+                0
+            ) + 1
+            FROM contestants
+            """
+        )
+
+
+        row = cursor.fetchone()
+
+        number = int(row[0])
+
+
+        # ----------------------------------------------------
+        # إرسال Telegram
+        # ----------------------------------------------------
 
         send_to_telegram(
             number,
             name
         )
 
-    except requests.RequestException:
-        app.logger.exception(
-            "تعذّر الاتصال بواجهة Telegram API"
+
+        # ----------------------------------------------------
+        # حفظ المتسابق
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            INSERT INTO contestants (
+                id,
+                name,
+                normalized_name
+            )
+            VALUES (
+                %s,
+                %s,
+                %s
+            )
+            """,
+            (
+                number,
+                name,
+                normalized_name
+            )
         )
+
+
+        connection.commit()
+
+
+        return {
+            "success": True,
+            "duplicate": False,
+            "number": number
+        }
+
+
+    except Exception:
+
+        connection.rollback()
+
+        raise
+
+
+    finally:
+
+        connection.close()
+
+
+# ============================================================
+# الصفحة الرئيسية
+# ============================================================
+
+@app.route(
+    "/",
+    methods=["GET", "POST"]
+)
+def register():
+
+    # --------------------------------------------------------
+    # GET
+    # --------------------------------------------------------
+
+    if request.method == "GET":
 
         return render_template_string(
             PAGE,
             success=False,
-            error="تعذّر إرسال التسجيل الآن. يرجى المحاولة مرة أخرى بعد قليل."
-        ), 502
-
-    except RuntimeError as exc:
-        app.logger.error(
-            "Telegram configuration/API error: %s",
-            exc
+            error=None
         )
 
-        return render_template_string(
-            PAGE,
-            success=False,
-            error="خدمة التسجيل غير مكتملة الإعداد. يرجى التواصل مع المنظّمين."
-        ), 503
 
-    return render_template_string(
-        PAGE,
-        success=True,
-        error=None
+    # --------------------------------------------------------
+    # الحصول على الاسم
+    # --------------------------------------------------------
+
+    name = request.form.get(
+        "name",
+        ""
     )
 
 
+    # تنظيف المسافات
+    name = re.sub(
+        r"\s+",
+        " ",
+        name.strip()
+    )
+
+
+    # --------------------------------------------------------
+    # التحقق من الاسم
+    # --------------------------------------------------------
+
+    if len(name) < 2 or len(name) > 80:
+
+        return render_template_string(
+            PAGE,
+            success=False,
+            error=(
+                "يرجى إدخال اسم يتراوح "
+                "بين حرفين و80 حرفًا."
+            )
+        ), 400
+
+
+    # --------------------------------------------------------
+    # تسجيل المتسابق
+    # --------------------------------------------------------
+
+    try:
+
+        result = register_contestant(
+            name
+        )
+
+
+        # ----------------------------------------------------
+        # الاسم مكرر
+        # ----------------------------------------------------
+
+        if result["duplicate"]:
+
+            return render_template_string(
+                PAGE,
+                success=False,
+                error=(
+                    "عذراً، هذا الاسم مسجل مسبقاً، "
+                    "يرجى إدخال اسم آخر."
+                )
+            ), 409
+
+
+        # ----------------------------------------------------
+        # نجاح
+        # ----------------------------------------------------
+
+        return render_template_string(
+            PAGE,
+            success=True,
+            error=None
+        )
+
+
+    # --------------------------------------------------------
+    # خطأ Telegram
+    # --------------------------------------------------------
+
+    except requests.RequestException:
+
+        app.logger.exception(
+            "تعذر الاتصال بواجهة Telegram API"
+        )
+
+
+        return render_template_string(
+            PAGE,
+            success=False,
+            error=(
+                "تعذّر إرسال التسجيل الآن. "
+                "يرجى المحاولة مرة أخرى بعد قليل."
+            )
+        ), 502
+
+
+    # --------------------------------------------------------
+    # خطأ الإعدادات
+    # --------------------------------------------------------
+
+    except RuntimeError as exc:
+
+        app.logger.error(
+            "Configuration error: %s",
+            exc
+        )
+
+
+        return render_template_string(
+            PAGE,
+            success=False,
+            error=(
+                "خدمة التسجيل غير مكتملة الإعداد. "
+                "يرجى التواصل مع المنظّمين."
+            )
+        ), 503
+
+
+    # --------------------------------------------------------
+    # خطأ قاعدة البيانات
+    # --------------------------------------------------------
+
+    except Exception:
+
+        app.logger.exception(
+            "Database/registration error"
+        )
+
+
+        return render_template_string(
+            PAGE,
+            success=False,
+            error=(
+                "حدث خطأ أثناء معالجة التسجيل. "
+                "يرجى المحاولة مرة أخرى بعد قليل."
+            )
+        ), 500
+
+
+# ============================================================
+# تشغيل التطبيق
+# ============================================================
+
 if __name__ == "__main__":
+
+    # إنشاء جدول قاعدة البيانات عند تشغيل التطبيق.
+
+    try:
+
+        init_database()
+
+        print(
+            "Database initialized successfully."
+        )
+
+    except Exception as exc:
+
+        print(
+            "Database initialization failed:",
+            exc
+        )
+
+
     # للتطوير المحلي فقط.
-    # في Render شغّل التطبيق بواسطة Gunicorn.
+    # Render يستخدم Gunicorn.
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
-            os.environ.get("PORT", "5000")
+            os.environ.get(
+                "PORT",
+                "5000"
+            )
         ),
+
         debug=False
-) 
+)
