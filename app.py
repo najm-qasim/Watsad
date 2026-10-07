@@ -1,3 +1,4 @@
+import hmac
 import logging
 import os
 import re
@@ -7,11 +8,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import requests
-from flask import Flask, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request
 
-# بيانات تيليجرام تُقرأ من متغيرات البيئة.
+# إعدادات البوت من متغيرات البيئة.
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+# اختياري: ضع Telegram user ID الخاص بك لمنع الآخرين في المجموعة من اعتماد التسجيل.
+TELEGRAM_ADMIN_USER_ID = os.environ.get("TELEGRAM_ADMIN_USER_ID", "").strip()
 
 # ملفات التسجيل المحلية، وتُحفظ بجانب app.py.
 NAMES_FILE = "names.txt"
@@ -23,19 +27,18 @@ LOCK_PATH = APP_DIR / ".registration.lock"
 
 TELEGRAM_TIMEOUT_SECONDS = 10
 MAX_NAME_LENGTH = 80
+REVIEWED_PREFIX = "✅ تمت المراجعة\n\n"
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 app.logger.setLevel(logging.INFO)
 
-# القفل يمنع تداخل التسجيلات المتزامنة.
-# flock ينسّق بين عمليات Gunicorn على Linux.
+# قفل لمنع تضارب التسجيلات المتزامنة بين الخيوط وعمليات Gunicorn على Linux.
 _THREAD_LOCK = threading.RLock()
 try:
     import fcntl
 except ImportError:  # توافق احتياطي مع الأنظمة غير الداعمة لـ POSIX
     fcntl = None
-
 
 PAGE = r"""<!doctype html>
 <html lang="ar" dir="rtl">
@@ -72,10 +75,7 @@ PAGE = r"""<!doctype html>
       background: #fbfdff; color: #102a43; font: inherit; outline: none;
       transition: border-color .2s, box-shadow .2s;
     }
-    input:focus {
-      border-color: #168f82;
-      box-shadow: 0 0 0 4px rgba(22,143,130,.12);
-    }
+    input:focus { border-color: #168f82; box-shadow: 0 0 0 4px rgba(22,143,130,.12); }
     button {
       width: 100%; min-height: 52px; margin-top: 16px; border: 0;
       border-radius: 12px; color: #fff; background: #087f70;
@@ -84,10 +84,7 @@ PAGE = r"""<!doctype html>
     }
     button:hover { background: #06695e; }
     button:active { transform: translateY(1px); }
-    .message {
-      margin: 0 0 20px; padding: 13px 15px;
-      border-radius: 11px; line-height: 1.8;
-    }
+    .message { margin: 0 0 20px; padding: 13px 15px; border-radius: 11px; line-height: 1.8; }
     .success { color: #17653d; background: #e8f7ed; border: 1px solid #b8e7c8; }
     .error { color: #9f2d2d; background: #fff0f0; border: 1px solid #f1c5c5; }
     .hint { margin: 13px 0 0; color: #718395; font-size: 12px; line-height: 1.7; }
@@ -99,14 +96,10 @@ PAGE = r"""<!doctype html>
     <span class="badge">● التسجيل مفتوح</span>
     <h1>تسجيل المتسابقين</h1>
     <p class="intro">أدخل اسمك لإكمال التسجيل في المسابقة.</p>
-
     {% if message %}
       <div class="message {{ message_type }}"
-           role="{{ 'status' if message_type == 'success' else 'alert' }}">
-        {{ message }}
-      </div>
+           role="{{ 'status' if message_type == 'success' else 'alert' }}">{{ message }}</div>
     {% endif %}
-
     <form method="post" action="/" autocomplete="on">
       <label for="name">اسم المتسابق</label>
       <input id="name" name="name" type="text" maxlength="80"
@@ -114,7 +107,6 @@ PAGE = r"""<!doctype html>
       <button type="submit">إرسال التسجيل</button>
       <p class="hint">يجب أن يتراوح الاسم بين حرفين و80 حرفًا.</p>
     </form>
-
     <footer>نظام تسجيل المسابقة</footer>
   </main>
 </body>
@@ -126,12 +118,70 @@ class RegistrationError(Exception):
 
 
 class TelegramError(RegistrationError):
-    """يُرفع عند فشل إرسال الرسالة إلى تيليجرام."""
+    """يُرفع عند فشل Telegram Bot API."""
+
+
+def telegram_api(method, payload):
+    """استدعاء Telegram Bot API والتحقق من نجاح الاستجابة."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise TelegramError("متغير TELEGRAM_BOT_TOKEN غير مضبوط.")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        response = requests.post(url, json=payload, timeout=TELEGRAM_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise TelegramError(f"فشل طلب Telegram API: {method}") from exc
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        description = result.get("description", "استجابة غير ناجحة") if isinstance(result, dict) else "استجابة غير صالحة"
+        raise TelegramError(f"Telegram API {method}: {description}")
+
+    return result.get("result")
+
+
+def build_keyboard(name, contestant_number, reviewed=False):
+    """زر نسخ الاسم وزر تبديل حالة المراجعة."""
+    if reviewed:
+        review_button = {
+            "text": "✅ تمت المراجعة",
+            "callback_data": f"done:{contestant_number}",
+        }
+    else:
+        review_button = {
+            "text": "☑️ تمت المراجعة",
+            "callback_data": f"review:{contestant_number}",
+        }
+
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📋 نسخ الاسم",
+                    "copy_text": {"text": name},
+                }
+            ],
+            [review_button],
+        ]
+    }
+
+
+def send_registration_message(name, contestant_number):
+    """إرسال الاسم والرقم مع زري النسخ واعتماد المراجعة."""
+    return telegram_api(
+        "sendMessage",
+        {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": f"{contestant_number} - {name}",
+            "reply_markup": build_keyboard(name, contestant_number),
+        },
+    )
 
 
 @contextmanager
 def registration_lock():
-    """قفل عمليات التسجيل المتزامنة عبر خيوط وعمليات الخادم."""
+    """قفل عمليات التسجيل المتزامنة عبر الخيوط وعمليات الخادم."""
     with _THREAD_LOCK:
         lock_file = None
         try:
@@ -150,17 +200,14 @@ def registration_lock():
 
 
 def read_registered_names():
-    """قراءة الأسماء المسجلة؛ الملف غير الموجود يعني عدم وجود تسجيلات."""
     try:
         content = NAMES_PATH.read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-
     return [line.strip() for line in content.splitlines() if line.strip()]
 
 
 def read_counter(number_of_names):
-    """قراءة آخر رقم تسلسلي أو التهيئة من عدد الأسماء عند غياب الملف."""
     try:
         raw_value = COUNTER_PATH.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -168,28 +215,20 @@ def read_counter(number_of_names):
 
     if not raw_value:
         return number_of_names
-
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise RegistrationError(
-            "ملف العداد يحتوي على قيمة غير صالحة."
-        ) from exc
-
+        raise RegistrationError("ملف العداد يحتوي على قيمة غير صالحة.") from exc
     if value < 0:
         raise RegistrationError("ملف العداد يحتوي على قيمة غير صالحة.")
-
     return max(value, number_of_names)
 
 
 def stage_text_file(destination, content):
-    """كتابة ملف مؤقت بجانب الملف الأصلي تمهيدًا لاستبداله بصورة ذرية."""
+    """إنشاء ملف مؤقت؛ لا يتغير الملف الأصلي قبل نجاح إرسال تيليجرام."""
     fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=str(destination.parent),
+        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
     )
-
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as temporary_file:
             temporary_file.write(content)
@@ -201,48 +240,84 @@ def stage_text_file(destination, content):
         except OSError:
             pass
         raise
-
     return Path(temporary_name)
 
 
-def send_telegram_message(message_text):
-    """إرسال النص المحدد فقط إلى محادثة تيليجرام."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise TelegramError("إعدادات تيليجرام غير مكتملة.")
-
-    url = (
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message_text,
-            },
-            timeout=TELEGRAM_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        result = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise TelegramError(
-            "تعذر الاتصال بتيليجرام أو قراءة استجابته."
-        ) from exc
-
-    if not isinstance(result, dict) or not result.get("ok"):
-        raise TelegramError("لم يؤكد تيليجرام استلام رسالة التسجيل.")
-
-
 def render_page(message=None, message_type=None, status=200):
-    return (
-        render_template_string(
-            PAGE,
-            message=message,
-            message_type=message_type,
-        ),
-        status,
-    )
+    return render_template_string(
+        PAGE, message=message, message_type=message_type
+    ), status
+
+
+def answer_callback_query(callback_query_id, text=None):
+    """إيقاف مؤشر الانتظار الذي يعرضه Telegram بعد ضغط زر callback."""
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text[:200]
+    telegram_api("answerCallbackQuery", payload)
+
+
+def handle_review_callback(callback_query):
+    """اعتماد المراجعة وتحديث الرسالة مع الإبقاء على زر نسخ الاسم."""
+    callback_id = callback_query.get("id")
+    data = callback_query.get("data", "")
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+
+    if not callback_id or not isinstance(data, str):
+        return
+
+    # السماح بالتفاعل فقط داخل المحادثة التي تستقبل التسجيلات.
+    if str(chat.get("id", "")) != TELEGRAM_CHAT_ID:
+        answer_callback_query(callback_id, "هذه الرسالة ليست في محادثة التسجيل.")
+        return
+
+    # اختياري للمجموعات: حصر زر المراجعة على حساب Telegram واحد.
+    if TELEGRAM_ADMIN_USER_ID:
+        clicker_id = str((callback_query.get("from") or {}).get("id", ""))
+        if clicker_id != TELEGRAM_ADMIN_USER_ID:
+            answer_callback_query(callback_id, "هذا الزر مخصص للمسؤول فقط.")
+            return
+
+    match = re.fullmatch(r"(review|done):(\d+)", data)
+    if not match:
+        answer_callback_query(callback_id, "زر غير معروف.")
+        return
+
+    action, number = match.groups()
+    message_text = message.get("text", "")
+
+    if action == "done" or message_text.startswith(REVIEWED_PREFIX):
+        answer_callback_query(callback_id, "تمت مراجعة هذا الاسم مسبقًا.")
+        return
+
+    # تحقق من أن callback يخص رسالة تسجيل بالرقم نفسه.
+    registration_match = re.fullmatch(r"(\d+) - (.+)", message_text, flags=re.DOTALL)
+    if not registration_match or registration_match.group(1) != number:
+        answer_callback_query(callback_id, "تعذر التحقق من بيانات التسجيل.")
+        return
+
+    name = registration_match.group(2)
+    try:
+        # acknowledge الضغط أولًا كي لا يبقى مؤشر الانتظار ظاهرًا.
+        answer_callback_query(callback_id, "تم اعتماد المراجعة.")
+    except TelegramError:
+        app.logger.exception("تعذر إظهار إشعار callback في تيليجرام")
+
+    edited_text = f"{REVIEWED_PREFIX}{message_text}"
+    try:
+        telegram_api(
+            "editMessageText",
+            {
+                "chat_id": chat["id"],
+                "message_id": message["message_id"],
+                "text": edited_text,
+                "reply_markup": build_keyboard(name, int(number), reviewed=True),
+            },
+        )
+    except (TelegramError, KeyError, TypeError):
+        app.logger.exception("تعذر تحديث رسالة التسجيل بعد المراجعة")
+        raise
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -250,15 +325,11 @@ def register():
     if request.method == "GET":
         return render_page()
 
-    # إزالة المسافات الزائدة والمتكررة قبل فحص الاسم.
-    # الأقواس هنا مكتملة: request.form.get("name", "")
+    # إزالة المسافات الزائدة والمتكررة؛ الأقواس مكتملة عمدًا.
     name = re.sub(r"\s+", " ", request.form.get("name", "").strip())
-
     if not 2 <= len(name) <= MAX_NAME_LENGTH:
         return render_page(
-            "يرجى إدخال اسم يتراوح بين حرفين و80 حرفًا.",
-            "error",
-            400,
+            "يرجى إدخال اسم يتراوح بين حرفين و80 حرفًا.", "error", 400
         )
 
     staged_names = None
@@ -267,42 +338,27 @@ def register():
     try:
         with registration_lock():
             registered_names = read_registered_names()
+            existing_normalized = {registered.casefold() for registered in registered_names}
 
-            # منع تكرار الاسم بعد تنظيف المسافات.
-            normalized_existing_names = {
-                existing.casefold() for existing in registered_names
-            }
-
-            if name.casefold() in normalized_existing_names:
+            if name.casefold() in existing_normalized:
                 return render_page(
                     "عذراً، هذا الاسم مسجل مسبقاً، يرجى إدخال اسم آخر.",
                     "error",
                     409,
                 )
 
-            last_number = read_counter(len(registered_names))
-            contestant_number = last_number + 1
-
-            # الرسالة المرسلة إلى تيليجرام بهذه الصيغة فقط.
-            telegram_text = f"{contestant_number} - {name}"
-
-            # تجهيز الملفات المؤقتة أولًا؛ لا تُحدّث الملفات الأصلية
-            # إلا بعد تأكيد تيليجرام نجاح الإرسال.
+            contestant_number = read_counter(len(registered_names)) + 1
             updated_names = registered_names + [name]
-            names_content = "".join(
-                f"{registered_name}\n" for registered_name in updated_names
-            )
+            names_content = "".join(f"{registered}\n" for registered in updated_names)
             counter_content = f"{contestant_number}\n"
 
             staged_names = stage_text_file(NAMES_PATH, names_content)
             staged_counter = stage_text_file(COUNTER_PATH, counter_content)
 
-            send_telegram_message(telegram_text)
-
-            # استبدال كل ملف ذريًا بعد نجاح الإرسال.
+            # لا تُحفظ الملفات إلا بعد أن يؤكد Telegram نجاح الإرسال.
+            send_registration_message(name, contestant_number)
             os.replace(staged_names, NAMES_PATH)
             staged_names = None
-
             os.replace(staged_counter, COUNTER_PATH)
             staged_counter = None
 
@@ -319,24 +375,16 @@ def register():
             "error",
             502,
         )
-
     except (OSError, UnicodeError, RegistrationError):
         app.logger.exception("خطأ في ملفات التسجيل أو إعداداته")
         return render_page(
-            "حدث خطأ أثناء حفظ التسجيل. لم يكتمل التسجيل؛ يرجى المحاولة لاحقًا.",
-            "error",
-            500,
+            "حدث خطأ أثناء حفظ التسجيل. يرجى المحاولة لاحقًا.", "error", 500
         )
-
     except Exception:
-        # منع ظهور تفاصيل داخلية أو توقف صفحة التسجيل بسبب خطأ غير متوقع.
         app.logger.exception("خطأ غير متوقع أثناء التسجيل")
         return render_page(
-            "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.",
-            "error",
-            500,
+            "حدث خطأ غير متوقع. يرجى المحاولة لاحقًا.", "error", 500
         )
-
     finally:
         for staged_file in (staged_names, staged_counter):
             if staged_file is not None:
@@ -346,8 +394,40 @@ def register():
                     app.logger.exception("تعذر حذف ملف مؤقت للتسجيل")
 
 
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """استقبال ضغط زر «تمت المراجعة» من Telegram عبر Webhook."""
+    if not TELEGRAM_WEBHOOK_SECRET:
+        app.logger.error("TELEGRAM_WEBHOOK_SECRET غير مضبوط")
+        return jsonify(ok=False, error="webhook_not_configured"), 503
+
+    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(supplied_secret, TELEGRAM_WEBHOOK_SECRET):
+        return jsonify(ok=False, error="unauthorized"), 403
+
+    update = request.get_json(silent=True)
+    if not isinstance(update, dict):
+        return jsonify(ok=False, error="invalid_update"), 400
+
+    callback_query = update.get("callback_query")
+    if not isinstance(callback_query, dict):
+        # تجاهل تحديثات تيليجرام الأخرى مثل الرسائل العادية.
+        return jsonify(ok=True), 200
+
+    try:
+        handle_review_callback(callback_query)
+    except TelegramError:
+        # 5xx يجعل Telegram يعيد إرسال الـ update عند الفشل المؤقت.
+        return jsonify(ok=False, error="telegram_api_error"), 500
+    except Exception:
+        app.logger.exception("فشل معالجة Telegram callback")
+        return jsonify(ok=False, error="callback_processing_error"), 500
+
+    return jsonify(ok=True), 200
+
+
 if __name__ == "__main__":
-    # للتشغيل المحلي. على Render استخدم: gunicorn app:app
+    # للتشغيل المحلي فقط. في Render استخدم أمر التشغيل: gunicorn app:app
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "5000")),
